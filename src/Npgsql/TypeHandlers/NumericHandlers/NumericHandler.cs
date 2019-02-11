@@ -27,7 +27,9 @@ using Npgsql.TypeHandling;
 using Npgsql.TypeMapping;
 using NpgsqlTypes;
 using System;
+using System.Collections.Generic;
 using System.Data;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 
 namespace Npgsql.TypeHandlers.NumericHandlers
@@ -35,10 +37,10 @@ namespace Npgsql.TypeHandlers.NumericHandlers
     /// <remarks>
     /// http://www.postgresql.org/docs/current/static/datatype-numeric.html
     /// </remarks>
-    [TypeMapping("numeric", NpgsqlDbType.Numeric, new[] { DbType.Decimal, DbType.VarNumeric }, typeof(decimal), DbType.Decimal)]
+    [TypeMapping("numeric", NpgsqlDbType.Numeric, new[] { DbType.Decimal, DbType.VarNumeric }, new[] { typeof(decimal), typeof(BigInteger) }, DbType.Decimal)]
     class NumericHandler : NpgsqlSimpleTypeHandler<decimal>,
         INpgsqlSimpleTypeHandler<byte>, INpgsqlSimpleTypeHandler<short>, INpgsqlSimpleTypeHandler<int>, INpgsqlSimpleTypeHandler<long>,
-        INpgsqlSimpleTypeHandler<float>, INpgsqlSimpleTypeHandler<double>
+        INpgsqlSimpleTypeHandler<float>, INpgsqlSimpleTypeHandler<double>, INpgsqlSimpleTypeHandler<BigInteger>
     {
         const int MaxDecimalScale = 28;
 
@@ -135,6 +137,74 @@ namespace Npgsql.TypeHandlers.NumericHandlers
         double INpgsqlSimpleTypeHandler<double>.Read(NpgsqlReadBuffer buf, int len, [CanBeNull] FieldDescription fieldDescription)
             => (double)Read(buf, len, fieldDescription);
 
+
+        BigInteger INpgsqlSimpleTypeHandler<BigInteger>.Read(NpgsqlReadBuffer buf, int len, FieldDescription fieldDescription)
+        {
+            var result = new BigInteger();
+            var groups = buf.ReadInt16();
+            var weight = buf.ReadInt16() - groups + 1;
+            var sign = buf.ReadUInt16();
+
+            if (sign == SignNan)
+                throw new NpgsqlSafeReadException(new InvalidCastException("Numeric NaN not supported by System.Numerics.BigInteger"));
+
+            var scale = buf.ReadInt16();
+            if (scale > 0)
+                throw new NpgsqlSafeReadException(new OverflowException("Numeric value does not fit in a System.Numerics.BigInteger"));
+
+            try
+            {
+                var scaleDifference = scale + weight * MaxGroupScale;
+                if (groups == MaxGroupCount)
+                {
+                    while (groups-- > 1)
+                    {
+                        result = result * MaxGroupSize;
+                        result = result + buf.ReadUInt16();
+                    }
+
+                    var group = buf.ReadUInt16();
+                    var groupSize = DecimalRaw.Powers10[-scaleDifference];
+                    if (group % groupSize != 0)
+                        throw new NpgsqlSafeReadException(new OverflowException("Numeric value does not fit in a System.Numerics.BigInteger"));
+
+                    result = result * (MaxGroupSize / groupSize);
+                    result = result + (group / groupSize);
+                }
+                else
+                {
+                    while (groups-- > 0)
+                    {
+                        result = result * MaxGroupSize;
+                        result = result + buf.ReadUInt16();
+                    }
+
+                    if (scaleDifference < 0)
+                    {
+                        result = result / (BigInteger)Math.Pow(10, -scaleDifference);
+                    }
+                    else
+                    {
+                        while (scaleDifference > 0)
+                        {
+                            var scaleChunk = Math.Min(DecimalRaw.MaxUInt32Scale, scaleDifference);
+                            result = result * (BigInteger)Math.Pow(10, scaleChunk);
+                            scaleDifference -= scaleChunk;
+                        }
+                    }
+                }
+            }
+            catch (OverflowException e)
+            {
+                throw new NpgsqlSafeReadException(e);
+            }
+
+            if (sign == SignNegative)
+                result = result * -1;
+
+            return result;
+        }
+
         #endregion Read
 
         #region Write
@@ -186,6 +256,34 @@ namespace Npgsql.TypeHandlers.NumericHandlers
 
         public int ValidateAndGetLength(byte value, NpgsqlParameter parameter)
             => ValidateAndGetLength((decimal)value, parameter);
+
+
+        public int ValidateAndGetLength(BigInteger value, NpgsqlParameter parameter)
+        {
+            var groupCount = 0;
+            var raw = new BigInteger(value.ToByteArray());
+            if (!raw.IsZero)
+            {
+                BigInteger remainder;
+
+                do
+                {
+                    remainder = raw % MaxGroupSize;
+                    raw = (raw - remainder) / MaxGroupSize;
+                } while (remainder.IsZero);
+
+
+                groupCount++;
+
+                while (!raw.IsZero)
+                {
+                    raw = raw / MaxGroupSize;
+                    groupCount++;
+                }
+            }
+
+            return 4 * sizeof(short) + groupCount * sizeof(short);
+        }
 
         public override unsafe void Write(decimal value, NpgsqlWriteBuffer buf, NpgsqlParameter parameter)
         {
@@ -250,6 +348,52 @@ namespace Npgsql.TypeHandlers.NumericHandlers
 
         public void Write(double value, NpgsqlWriteBuffer buf, NpgsqlParameter parameter)
             => Write((decimal)value, buf, parameter);
+
+        public void Write(BigInteger value, NpgsqlWriteBuffer buf, NpgsqlParameter parameter)
+        {
+            var sig = value.Sign;
+            var groups = new List<short>(MaxGroupCount);
+            var weight = 0;
+
+            var raw = sig * value;
+            if (!raw.IsZero)
+            {
+                weight = -1;
+
+                BigInteger remainder;
+                do
+                {
+
+                    remainder = raw % MaxGroupSize;
+                    raw = (raw - remainder) / MaxGroupSize;
+
+                    if (!remainder.IsZero)
+                        break;
+
+                    weight++;
+
+                } while (true);
+
+                groups.Add((short)remainder);
+
+                while (!raw.IsZero)
+                {
+                    remainder = raw % MaxGroupSize;
+                    raw = (raw - remainder) / MaxGroupSize;
+                    groups.Add((short)remainder);
+                }
+            }
+
+            buf.WriteInt16(groups.Count);
+            buf.WriteInt16(groups.Count + weight);
+            buf.WriteInt16(sig > 0 ? SignPositive : SignNegative);
+            buf.WriteInt16(0);
+
+            for (var i = groups.Count - 1; i >= 0; i--)
+            {
+                buf.WriteInt16(groups[i]);
+            }
+        }
 
         #endregion Write
     }
